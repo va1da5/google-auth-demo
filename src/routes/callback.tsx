@@ -26,6 +26,18 @@ function Callback() {
 
       const token = await getTokens(searchParams?.code);
 
+      if (
+        !token.accessToken ||
+        !token.accessToken.length ||
+        !token.refreshToken ||
+        !token.refreshToken.length
+      ) {
+        navigate({
+          to: "/login",
+        });
+        return;
+      }
+
       setAuth({
         access: token.accessToken,
         refresh: token.refreshToken,

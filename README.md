@@ -63,3 +63,6 @@ pnpm run dev
 - [TanStack Router](https://tanstack.com/router/latest/docs/framework/react/overview)
 - [React Login Authentication with JWT Access, Refresh Tokens, Cookies and Axios](https://www.youtube.com/watch?v=nI8PYZNFtac)
 - [gitdagray/react_jwt_auth](https://github.com/gitdagray/react_jwt_auth)
+- [Google JSON Web Key Set](https://www.googleapis.com/oauth2/v3/certs)
+- [Google /.well-known/openid-configuration](https://accounts.google.com/.well-known/openid-configuration)
+- [The BEST OAuth Golang Tutorial for Authentication | Sign In With Google](https://www.youtube.com/watch?v=iHFQyd__2A0)
