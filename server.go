@@ -51,6 +51,15 @@ type CustomClaims struct {
 	jwt.RegisteredClaims
 }
 
+func (c CustomClaims) ToMap() map[string]any {
+	return map[string]any{
+		"email":   c.Email,
+		"sub":     c.Subject,
+		"picture": c.Picture,
+		"name":    c.Name,
+	}
+}
+
 type DiscoveryDocument struct {
 	Issuer  string `json:"issuer"`
 	JWKSURI string `json:"jwks_uri"`
@@ -107,9 +116,10 @@ func main() {
 	app.init()
 
 	r := chi.NewRouter()
+	auth_r := chi.NewRouter()
 
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"https://*", "http://*"},
+		AllowedOrigins:   []string{"http://localhost:5173", "https://localhost:5173"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposedHeaders:   []string{"Link"},
@@ -120,6 +130,7 @@ func main() {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
+	auth_r.Use(app.JWTMiddleware)
 
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("Backend server"))
@@ -129,13 +140,11 @@ func main() {
 
 	r.Post("/token/refresh", app.refreshToken)
 
-	r.Get("/me", app.getUserDetails)
+	auth_r.Get("/me", app.getUserDetails)
+
+	r.Mount("/", auth_r)
 
 	http.ListenAndServe(":3000", r)
-}
-
-func (app *Application) index(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte(app.config.oauth.client_id))
 }
 
 func (app *Application) provideToken(w http.ResponseWriter, r *http.Request) {
@@ -155,17 +164,50 @@ func (app *Application) provideToken(w http.ResponseWriter, r *http.Request) {
 
 	claims, err := app.verifyGoogleIDToken(context.Background(), tokens.IdToken)
 
-	// TODO
-	// 1. create local token creation
+	access_token := app.config.jwt.access.generateToken(claims.ToMap())
+	refresh_token := app.config.jwt.refresh.generateToken(claims.ToMap())
 
+	response := map[string]string{
+		"accessToken":  access_token,
+		"refreshToken": refresh_token,
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (app *Application) refreshToken(w http.ResponseWriter, r *http.Request) {
-	// 2. implement
+	type Body struct {
+		RefreshToken string `json:"refreshToken"`
+	}
+
+	var b Body
+
+	err := json.NewDecoder(r.Body).Decode(&b)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	claims, err := app.config.jwt.refresh.parseToken(b.RefreshToken)
+
+	if err != nil {
+		writeJSONError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	access_token := app.config.jwt.access.generateToken(claims.ToMap())
+
+	response := map[string]string{
+		"accessToken": access_token,
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (app *Application) getUserDetails(w http.ResponseWriter, r *http.Request) {
-	// 3. Parse access token and return claims
+	claims := r.Context().Value("user")
+	writeJSON(w, http.StatusOK, claims)
 }
 
 func (app *Application) init() {
@@ -184,7 +226,7 @@ func (app *Application) init() {
 		},
 		refresh: TokenConfig{
 			secret:     []byte(os.Getenv("JWT_REFRESH_TOKEN_SECRET")),
-			expires_in: GetEnvInt("JWT_ACCESS_TOKEN_EXPIRES_IN", 0),
+			expires_in: GetEnvInt("JWT_REFRESH_TOKEN_EXPIRES_IN", 0),
 		},
 	}
 
@@ -403,16 +445,6 @@ func writeJSON(w http.ResponseWriter, status int, data any) error {
 	return json.NewEncoder(w).Encode(data)
 }
 
-func readJSON(w http.ResponseWriter, r *http.Request, data any) error {
-	maxBytes := 1_048_578 // accepts max 1MB of body
-	r.Body = http.MaxBytesReader(w, r.Body, int64(maxBytes))
-
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-
-	return decoder.Decode(data)
-}
-
 func writeJSONError(w http.ResponseWriter, status int, message string) error {
 	type envelope struct {
 		Error string `json:"error"`
@@ -421,7 +453,6 @@ func writeJSONError(w http.ResponseWriter, status int, message string) error {
 }
 
 func (oauth *OAuthConfig) exchangeCodeToTokens(code string) (*JWTTokenData, error) {
-	// oauth.client_token_uri
 	formData := url.Values{}
 	formData.Set("code", code)
 	formData.Set("client_id", oauth.client_id)
@@ -440,7 +471,7 @@ func (oauth *OAuthConfig) exchangeCodeToTokens(code string) (*JWTTokenData, erro
 	req.Header.Add("Accept", "application/json")
 	req.Header.Set("User-Agent", "Go-HTTP-Client/1.0")
 	client := &http.Client{
-		Timeout: 10 * time.Second, // Set a timeout
+		Timeout: 10 * time.Second,
 	}
 
 	resp, err := client.Do(req)
@@ -457,14 +488,69 @@ func (oauth *OAuthConfig) exchangeCodeToTokens(code string) (*JWTTokenData, erro
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated { // Adjust accepted statuses as needed
 		log.Printf("Received non-OK HTTP status: %d", resp.StatusCode)
 		log.Printf("Response Body (raw): %s\n", string(bodyBytes))
-		// You might want to return or handle this error more gracefully
 		return nil, errors.New(fmt.Sprintf("Received non-OK HTTP status: %d", resp.StatusCode))
 	}
-
-	// log.Printf("Response Body (raw): %s\n", string(bodyBytes))
 
 	tokens := JWTTokenData{}
 	json.Unmarshal(bodyBytes, &tokens)
 
 	return &tokens, nil
+}
+
+func (tc *TokenConfig) generateToken(claims jwt.MapClaims) string {
+	claims["exp"] = time.Now().Add(time.Second * time.Duration(tc.expires_in/1000)).Unix()
+
+	now := time.Now()
+
+	log.Printf("Now %d, expiration %d", now.Unix(), now.Add(time.Millisecond*time.Duration(tc.expires_in)).Unix())
+
+	t := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	s, err := t.SignedString(tc.secret)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+
+	return s
+}
+
+func (tc *TokenConfig) parseToken(token string) (*CustomClaims, error) {
+	claims := &CustomClaims{}
+
+	t, err := jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
+		return tc.secret, nil
+	}) // jwt.WithLeeway(1*time.Minute)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if !t.Valid {
+		return nil, errors.New("Access token is invalid")
+	}
+
+	return claims, nil
+}
+
+func (app *Application) JWTMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authz := r.Header.Get("authorization")
+
+		if len(authz) < 1 || len(strings.Split(authz, " ")) < 2 {
+			writeJSONError(w, http.StatusUnauthorized, "Forbidden")
+			return
+		}
+
+		token := strings.Split(authz, " ")[1]
+
+		claims, err := app.config.jwt.access.parseToken(token)
+
+		if err != nil {
+			writeJSONError(w, http.StatusForbidden, err.Error())
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), "user", claims)
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
